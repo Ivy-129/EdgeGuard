@@ -1,0 +1,75 @@
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <semaphore.h>
+#include <stdio.h>
+#include <time.h>
+
+#include "job.h"
+
+static double elapsed_seconds(const struct timespec *start,
+                              const struct timespec *end) {
+    return (double)(end->tv_sec - start->tv_sec) +
+           (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
+}
+
+int main(void) {
+    SharedJobTable *table = job_table_create();
+
+    if (table == NULL) {
+        perror("job_table_create");
+        return 1;
+    }
+
+    if (sem_wait(&table->lock) != 0) {
+        perror("sem_wait");
+        job_table_destroy(table);
+        return 1;
+    }
+
+    printf("Semaphore locked; testing timeout...\n");
+    fflush(stdout);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    JobRecord job;
+    int result = job_get(table, 1, &job);
+    int saved_errno = errno;
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    double elapsed = elapsed_seconds(&start, &end);
+
+    printf("Elapsed: %.2f seconds\n", elapsed);
+
+    sem_post(&table->lock);
+
+    if (result != -1 || saved_errno != ETIMEDOUT || elapsed < 1.5 ||
+        elapsed > 4.0) {
+        fprintf(stderr, "FAIL: Semaphore timeout behavior\n");
+        job_table_destroy(table);
+        return 1;
+    }
+
+    printf("PASS: Semaphore timeout detected\n");
+
+    uint32_t job_id;
+
+    if (job_create(table, TASK_BENCH, "100", &job_id) != 0) {
+        fprintf(stderr, "FAIL: Semaphore recovery test\n");
+        job_table_destroy(table);
+        return 1;
+    }
+
+    printf("PASS: Semaphore usable after release\n");
+
+    if (job_table_destroy(table) != 0) {
+        perror("job_table_destroy");
+        return 1;
+    }
+
+    printf("PASS: Semaphore Timeout Test\n");
+    return 0;
+}

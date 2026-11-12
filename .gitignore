@@ -1,0 +1,22 @@
+# Compiled files
+*.o
+*.so
+bin/server
+bin/client
+
+# Debug files
+*.log
+core
+core.*
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Packet captures
+*.pcap
+*.pcapng
+
+# Temporary files
+*.swp
+*~

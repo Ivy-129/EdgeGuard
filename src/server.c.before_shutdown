@@ -1,0 +1,601 @@
+
+#include "server.h"
+#include "ipc.h"
+#include "logger.h"
+#include "worker.h"
+#include "resource_monitor.h"
+#include <stdint.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <time.h>
+
+#define MAX_HANDLERS 32
+
+typedef struct {
+    pid_t pid;
+    uint32_t job_id;
+    struct timespec started_at;
+} WorkerEntry;
+
+static WorkerEntry workers[EDGE_MAX_WORKERS];
+static unsigned int worker_timeout_sec = 10;
+static uint64_t min_memory_kb = 128ULL * 1024ULL;
+
+static volatile sig_atomic_t stop = 0;
+static volatile sig_atomic_t child_exited = 0;
+
+typedef struct {
+    int fd;
+    pid_t pid;
+} HandlerEntry;
+
+static void on_stop(int sig) {
+    (void)sig;
+    stop = 1;
+}
+
+static void on_child(int sig) {
+    (void)sig;
+    child_exited = 1;
+}
+
+static void reap_children(SharedJobTable *table) {
+    int saved = errno;
+    int status;
+    pid_t pid;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        for (int i = 0; i < EDGE_MAX_WORKERS; ++i) {
+            if (workers[i].pid != pid)
+                continue;
+
+            uint32_t job_id = workers[i].job_id;
+            JobRecord job;
+
+            if (job_get(table, job_id, &job) == 0) {
+                if (job.status == JOB_RUNNING || job.status == JOB_STARTING) {
+
+                    const char *reason =
+                        WIFSIGNALED(status)
+                            ? "Worker terminated by signal\n"
+                            : "Worker exited before completion\n";
+
+                    job_finish(table, job_id, JOB_FAILED, reason);
+                }
+            }
+
+            edge_log(1, "Worker PID=%ld reaped, Job %u", (long)pid, job_id);
+
+            workers[i].pid = 0;
+            workers[i].job_id = 0;
+            break;
+        }
+    }
+
+    errno = saved;
+}
+
+static void close_handler(HandlerEntry *entry) {
+    if (entry->fd >= 0) {
+        close(entry->fd);
+        entry->fd = -1;
+    }
+    entry->pid = -1;
+}
+
+static double elapsed_seconds(const struct timespec *start,
+                              const struct timespec *end) {
+    double seconds = (double)(end->tv_sec - start->tv_sec);
+    double nanoseconds = (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
+
+    return seconds + nanoseconds;
+}
+
+static void check_worker_timeouts(SharedJobTable *table) {
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        edge_log(0, "Failed to read monotonic clock");
+        return;
+    }
+
+    for (int i = 0; i < EDGE_MAX_WORKERS; ++i) {
+        if (workers[i].pid <= 0)
+            continue;
+
+        if (workers[i].started_at.tv_sec == 0)
+            continue;
+
+        double elapsed = elapsed_seconds(&workers[i].started_at, &now);
+
+        if (elapsed < (double)worker_timeout_sec)
+            continue;
+
+        JobRecord job;
+        if (job_get(table, workers[i].job_id, &job) < 0)
+            continue;
+
+        if (job.status != JOB_RUNNING && job.status != JOB_STARTING)
+            continue;
+
+        if (kill(workers[i].pid, SIGKILL) == 0) {
+            job_finish(table, workers[i].job_id, JOB_TIMEOUT,
+                       "Worker exceeded execution time limit\n");
+
+            edge_log(1, "Worker PID=%ld timed out after %.2f seconds",
+                     (long)workers[i].pid, elapsed);
+        }
+    }
+}
+
+static int find_free_worker_slot(void) {
+    for (int i = 0; i < EDGE_MAX_WORKERS; ++i) {
+        if (workers[i].pid == 0)
+            return i;
+    }
+
+    return -1;
+}
+
+static int memory_admission_allowed(char *reason, size_t capacity) {
+    uint64_t available_kb = 0;
+
+    if (resource_get_available_memory_kb(&available_kb) < 0) {
+        snprintf(reason, capacity, "Cannot read available memory\n");
+        edge_log(0, "Memory admission: /proc/meminfo read failed");
+        return 0;
+    }
+
+    edge_log(2, "Memory admission: available=%llu KiB, minimum=%llu KiB",
+             (unsigned long long)available_kb,
+             (unsigned long long)min_memory_kb);
+
+    if (available_kb < min_memory_kb) {
+        snprintf(reason, capacity, "Insufficient available memory\n");
+        edge_log(1, "Memory admission rejected: insufficient memory");
+        return 0;
+    }
+
+    return 1;
+}
+
+static void handle_ipc_request(int fd, SharedJobTable *table,
+                               HandlerEntry handlers[MAX_HANDLERS]) {
+    IpcRequest request = {0};
+    IpcResponse response = {0};
+
+    if (ipc_recv_request(fd, &request) < 0)
+        return;
+
+    if (request.command != IPC_SUBMIT ||
+        (request.task_type != TASK_BENCH && request.task_type != TASK_HASH) ||
+        memchr(request.argument, '\0', sizeof(request.argument)) == NULL) {
+
+        response.success = 0;
+        snprintf(response.message, sizeof(response.message),
+                 "Invalid IPC request\n");
+
+    } else {
+        unsigned long limit = 0;
+        int valid = 1;
+
+        if (request.task_type == TASK_BENCH) {
+            char *end = NULL;
+            errno = 0;
+
+            limit = strtoul(request.argument, &end, 10);
+
+            if (errno != 0 || end == request.argument || *end != '\0' ||
+                limit == 0 || limit > 10000000UL) {
+                valid = 0;
+                snprintf(response.message, sizeof(response.message),
+                         "Invalid BENCH limit\n");
+            }
+        } else {
+            const char *filename = request.argument;
+
+            if (filename[0] == '\0' || strcmp(filename, ".") == 0 ||
+                strcmp(filename, "..") == 0 || strchr(filename, '/') != NULL) {
+                valid = 0;
+                snprintf(response.message, sizeof(response.message),
+                         "Invalid HASH filename\n");
+            }
+        }
+
+        if (!valid) {
+            response.success = 0;
+        } else {
+            int slot = find_free_worker_slot();
+
+            if (slot < 0) {
+                response.success = 0;
+                snprintf(response.message, sizeof(response.message),
+                         "All Worker slots are busy\n");
+
+            } else if (!memory_admission_allowed(response.message,
+                                                 sizeof(response.message))) {
+                response.success = 0;
+
+            } else {
+                uint32_t job_id = 0;
+
+                if (job_create(table, (TaskType)request.task_type,
+                               request.argument, &job_id) < 0) {
+
+                    response.success = 0;
+                    snprintf(response.message, sizeof(response.message),
+                             "Job table is full\n");
+
+                } else {
+
+                    int start_pipe[2];
+
+                    if (pipe(start_pipe) < 0) {
+                        job_finish(table, job_id, JOB_FAILED,
+                                   "Failed to create Worker pipe\n");
+
+                        response.success = 0;
+                        snprintf(response.message, sizeof(response.message),
+                                 "Worker pipe failed\n");
+
+                    } else {
+                        pid_t pid = fork();
+
+                        if (pid < 0) {
+                            close(start_pipe[0]);
+                            close(start_pipe[1]);
+
+                            job_finish(table, job_id, JOB_FAILED,
+                                       "Failed to fork Worker\n");
+
+                            response.success = 0;
+                            snprintf(response.message, sizeof(response.message),
+                                     "Worker fork failed\n");
+
+                        } else if (pid == 0) {
+                            close(start_pipe[1]);
+                            close(fd);
+                            for (int i = 0; i < MAX_HANDLERS; ++i) {
+                                if (handlers[i].fd >= 0 && handlers[i].fd != fd)
+                                    close(handlers[i].fd);
+                            }
+                            char signal_byte;
+                            ssize_t n;
+
+                            do {
+                                n = read(start_pipe[0], &signal_byte, 1);
+                            } while (n < 0 && errno == EINTR);
+
+                            close(start_pipe[0]);
+
+                            if (n != 1 || signal_byte != 'G')
+                                _exit(1);
+
+                            int rc;
+
+                            if (request.task_type == TASK_BENCH) {
+                                rc = worker_run_bench(table, job_id,
+                                                      (uint32_t)limit);
+                            } else {
+                                rc = worker_run_hash(table, job_id,
+                                                     request.argument);
+                            }
+
+                            _exit(rc == 0 ? 0 : 1);
+
+                        } else {
+                            close(start_pipe[0]);
+
+                            workers[slot].pid = pid;
+                            workers[slot].job_id = job_id;
+
+                            if (clock_gettime(CLOCK_MONOTONIC,
+                                              &workers[slot].started_at) < 0) {
+                                edge_log(0, "Failed to read Worker start time");
+                                workers[slot].started_at.tv_sec = 0;
+                                workers[slot].started_at.tv_nsec = 0;
+                            }
+
+                            if (job_set_running(table, job_id, pid) < 0) {
+                                edge_log(0, "Failed to mark Job %u RUNNING",
+                                         job_id);
+
+                                job_finish(table, job_id, JOB_FAILED,
+                                           "Failed to initialize Worker\n");
+
+                                close(start_pipe[1]);
+                                response.success = 0;
+                                snprintf(response.message,
+                                         sizeof(response.message),
+                                         "Worker initialization failed\n");
+
+                            } else {
+                                char go = 'G';
+
+                                ssize_t written;
+                                do {
+                                    written = write(start_pipe[1], &go, 1);
+                                } while (written < 0 && errno == EINTR);
+
+                                close(start_pipe[1]);
+
+                                if (written != 1) {
+                                    job_finish(table, job_id, JOB_FAILED,
+                                               "Failed to start Worker\n");
+
+                                    response.success = 0;
+                                    snprintf(response.message,
+                                             sizeof(response.message),
+                                             "Worker start failed\n");
+
+                                } else {
+                                    response.success = 1;
+                                    response.job_id = job_id;
+
+                                    edge_log(
+                                        1, "Worker PID=%ld started for Job %u",
+                                        (long)pid, job_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (ipc_send_response(fd, &response) < 0)
+        edge_log(0, "Failed to send IPC response");
+}
+
+int main(int argc, char **argv) {
+    int port = 8080;
+    int level = 1;
+    unsigned long long min_memory_mb = 128;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc)
+            level = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--worker-timeout-sec") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+
+            unsigned long value = strtoul(argv[++i], &end, 10);
+
+            if (errno != 0 || end == argv[i] || *end != '\0' || value < 1 ||
+                value > 3600) {
+                fprintf(stderr, "Invalid --worker-timeout-sec value\n");
+                return 1;
+            }
+
+            worker_timeout_sec = (unsigned int)value;
+        } else if (strcmp(argv[i], "--min-memory-mb") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+            min_memory_mb = strtoull(argv[++i], &end, 10);
+            if (errno != 0 || end == argv[i] || *end != '\0' ||
+                min_memory_mb > UINT64_MAX / 1024ULL) {
+                fprintf(stderr, "Invalid --min-memory-mb value\\n");
+                return 1;
+            }
+        } else {
+            fprintf(stderr,
+                    "Usage: %s [--port 8080] "
+                    "[--log-level 0|1|2] [--min-memory-mb N] "
+                    "[--worker-timeout-sec N]\n",
+                    argv[0]);
+            return 1;
+        }
+    }
+
+    if (port < 1 || port > 65535 || level < 0 || level > 2)
+        return 1;
+
+    min_memory_kb = (uint64_t)min_memory_mb * 1024ULL;
+    edge_log_set_level(level);
+    edge_log(1, "Worker timeout: %u seconds", worker_timeout_sec);
+    edge_log(1, "Minimum available memory: %llu MiB", min_memory_mb);
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_child;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    sa.sa_handler = on_stop;
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    SharedJobTable *table = job_table_create();
+
+    if (!table) {
+        perror("job_table_create");
+        return 1;
+    }
+
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (listener < 0) {
+        perror("socket");
+        job_table_destroy(table);
+        return 1;
+    }
+
+    int one = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr = {.sin_family = AF_INET,
+                               .sin_port = htons((unsigned short)port),
+                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(listener, 64) < 0) {
+
+        perror("bind/listen");
+        close(listener);
+        job_table_destroy(table);
+        return 1;
+    }
+
+    HandlerEntry handlers[MAX_HANDLERS];
+
+    for (int i = 0; i < MAX_HANDLERS; ++i) {
+        handlers[i].fd = -1;
+        handlers[i].pid = -1;
+    }
+
+    edge_log(1, "Listening on 127.0.0.1:%d", port);
+
+    while (!stop) {
+        if (child_exited) {
+            child_exited = 0;
+            reap_children(table);
+        }
+
+        check_worker_timeouts(table);
+
+        struct pollfd fds[MAX_HANDLERS + 1];
+        int indexes[MAX_HANDLERS + 1];
+        nfds_t count = 1;
+
+        fds[0].fd = listener;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
+        indexes[0] = -1;
+
+        for (int i = 0; i < MAX_HANDLERS; ++i) {
+            if (handlers[i].fd >= 0) {
+                fds[count].fd = handlers[i].fd;
+                fds[count].events = POLLIN;
+                fds[count].revents = 0;
+                indexes[count] = i;
+                ++count;
+            }
+        }
+
+        int ready = poll(fds, count, 1000);
+
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            break;
+        }
+
+        if (ready == 0) {
+            reap_children(table);
+            check_worker_timeouts(table);
+            continue;
+        }
+
+        if (fds[0].revents & POLLIN) {
+            int client_fd = accept(listener, NULL, NULL);
+
+            if (client_fd >= 0) {
+                int slot = -1;
+
+                for (int i = 0; i < MAX_HANDLERS; ++i) {
+                    if (handlers[i].fd < 0) {
+                        slot = i;
+                        break;
+                    }
+                }
+
+                if (slot < 0) {
+                    edge_log(0, "Too many clients");
+                    close(client_fd);
+                } else {
+                    int ipc_fds[2];
+
+                    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ipc_fds) < 0) {
+
+                        perror("socketpair");
+                        close(client_fd);
+
+                    } else {
+                        pid_t pid = fork();
+
+                        if (pid < 0) {
+                            perror("fork");
+                            close(ipc_fds[0]);
+                            close(ipc_fds[1]);
+                            close(client_fd);
+
+                        } else if (pid == 0) {
+                            close(listener);
+                            close(ipc_fds[0]);
+
+                            for (int i = 0; i < MAX_HANDLERS; ++i) {
+                                if (handlers[i].fd >= 0)
+                                    close(handlers[i].fd);
+                            }
+
+                            edge_log(1, "Handler started");
+
+                            handle_client(client_fd, ipc_fds[1], table);
+
+                            close(client_fd);
+                            close(ipc_fds[1]);
+
+                            edge_log(1, "Handler exited");
+                            _exit(0);
+
+                        } else {
+                            close(ipc_fds[1]);
+                            close(client_fd);
+
+                            handlers[slot].fd = ipc_fds[0];
+                            handlers[slot].pid = pid;
+
+                            edge_log(1, "Client connected; handler PID=%ld",
+                                     (long)pid);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (nfds_t p = 1; p < count; ++p) {
+            int index = indexes[p];
+
+            if (index < 0 || handlers[index].fd < 0)
+                continue;
+
+            if (fds[p].revents & POLLIN) {
+                handle_ipc_request(handlers[index].fd, table, handlers);
+            }
+
+            if (fds[p].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                close_handler(&handlers[index]);
+            }
+        }
+    }
+
+    close(listener);
+
+    for (int i = 0; i < MAX_HANDLERS; ++i)
+        close_handler(&handlers[i]);
+
+    reap_children(table);
+
+    /*
+     * Child handlers may still be alive.
+     * Avoid destroying their shared semaphore here.
+     * The mapping is reclaimed when processes exit.
+     */
+    edge_log(1, "Server shutting down");
+
+    return 0;
+}

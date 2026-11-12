@@ -1,0 +1,177 @@
+#define _DEFAULT_SOURCE
+#include "job.h"
+#include <time.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/* Create shared memory before fork(). */
+SharedJobTable *job_table_create(void) {
+    SharedJobTable *table =
+        mmap(NULL, sizeof(SharedJobTable), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    if (table == MAP_FAILED)
+        return NULL;
+
+    memset(table, 0, sizeof(*table));
+
+    if (sem_init(&table->lock, 1, 1) != 0) {
+        munmap(table, sizeof(*table));
+        return NULL;
+    }
+
+    table->next_job_id = 1;
+    return table;
+}
+
+int job_table_destroy(SharedJobTable *table) {
+    if (!table)
+        return -1;
+
+    if (sem_destroy(&table->lock) != 0)
+        return -1;
+
+    return munmap(table, sizeof(*table));
+}
+
+static int lock_table(SharedJobTable *table) {
+    struct timespec deadline;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+        return -1;
+
+    deadline.tv_sec += 2;
+
+    while (sem_timedwait(&table->lock, &deadline) == -1) {
+        if (errno == EINTR)
+            continue;
+
+        return -1;
+    }
+
+    return 0;
+}
+
+int job_create(SharedJobTable *table, TaskType type, const char *argument,
+               uint32_t *job_id) {
+    if (!table || !argument || !job_id)
+        return -1;
+
+    if (type != TASK_BENCH && type != TASK_HASH)
+        return -1;
+
+    if (strlen(argument) >= sizeof(table->jobs[0].argument))
+        return -1;
+
+    if (lock_table(table) != 0)
+        return -1;
+
+    int slot = -1;
+
+    for (int i = 0; i < EDGE_MAX_JOBS; i++) {
+        if (table->jobs[i].status == JOB_EMPTY) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0 || table->next_job_id == UINT32_MAX) {
+        sem_post(&table->lock);
+        return -1;
+    }
+
+    JobRecord *job = &table->jobs[slot];
+
+    memset(job, 0, sizeof(*job));
+
+    job->job_id = table->next_job_id++;
+    job->type = type;
+    job->status = JOB_STARTING;
+
+    strcpy(job->argument, argument);
+
+    *job_id = job->job_id;
+
+    sem_post(&table->lock);
+    return 0;
+}
+
+int job_get(SharedJobTable *table, uint32_t job_id, JobRecord *out) {
+    if (!table || !out || job_id == 0)
+        return -1;
+
+    if (lock_table(table) != 0)
+        return -1;
+
+    for (int i = 0; i < EDGE_MAX_JOBS; i++) {
+        if (table->jobs[i].status != JOB_EMPTY &&
+            table->jobs[i].job_id == job_id) {
+
+            *out = table->jobs[i];
+            sem_post(&table->lock);
+            return 0;
+        }
+    }
+
+    sem_post(&table->lock);
+    return -1;
+}
+
+int job_set_running(SharedJobTable *table, uint32_t job_id, pid_t worker_pid) {
+    if (!table || job_id == 0 || worker_pid <= 0)
+        return -1;
+
+    if (lock_table(table) != 0)
+        return -1;
+
+    for (int i = 0; i < EDGE_MAX_JOBS; ++i) {
+        JobRecord *job = &table->jobs[i];
+
+        if (job->status == JOB_STARTING && job->job_id == job_id) {
+
+            job->worker_pid = worker_pid;
+            job->status = JOB_RUNNING;
+
+            sem_post(&table->lock);
+            return 0;
+        }
+    }
+
+    sem_post(&table->lock);
+    return -1;
+}
+
+int job_finish(SharedJobTable *table, uint32_t job_id, JobStatus final_status,
+               const char *result) {
+    if (!table || job_id == 0 || !result)
+        return -1;
+
+    if (final_status != JOB_COMPLETED && final_status != JOB_FAILED &&
+        final_status != JOB_TIMEOUT)
+        return -1;
+
+    if (strlen(result) >= sizeof(table->jobs[0].result))
+        return -1;
+
+    if (lock_table(table) != 0)
+        return -1;
+
+    for (int i = 0; i < EDGE_MAX_JOBS; ++i) {
+        JobRecord *job = &table->jobs[i];
+
+        if (job->job_id == job_id &&
+            (job->status == JOB_RUNNING || job->status == JOB_STARTING)) {
+
+            job->status = final_status;
+            strcpy(job->result, result);
+
+            sem_post(&table->lock);
+            return 0;
+        }
+    }
+
+    sem_post(&table->lock);
+    return -1;
+}
